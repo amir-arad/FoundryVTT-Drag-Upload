@@ -50,12 +50,17 @@ Hooks.once('ready', async function() {
     await initializeDragUpload();
 
     // Enable binding
-    new DragDrop({
-        callbacks: {
-            drop: handleDrop
+    const canvasElement = document.getElementById("board");
+    canvasElement.addEventListener('dragover', (event) => {
+        // Only prevent default for file drops or HTTP URLs to allow drop
+        const hasFiles = event.dataTransfer.types.includes('Files');
+        const textData = event.dataTransfer.getData("Text");
+        const hasValidUrl = textData && textData.startsWith("http");
+        if (hasFiles || hasValidUrl) {
+            event.preventDefault();
         }
-    })
-    .bind(document.getElementById("board"));
+    });
+    canvasElement.addEventListener('drop', handleDrop);
 });
 
 async function initializeDragUpload() {
@@ -109,7 +114,6 @@ async function handlePlaylistDrop(event) {
 }
 
 async function handleDrop(event) {
-    event.preventDefault();
     console.debug("Got handleDrop event:");
     console.debug(event);
 
@@ -117,15 +121,22 @@ async function handleDrop(event) {
     console.debug("FileList is: ");
     console.debug(files);
 
+    // Only handle if there are files or a valid HTTP URL
+    const textData = event.dataTransfer.getData("Text");
+    const hasFiles = files && files.length > 0;
+    const hasValidUrl = textData && textData.startsWith("http");
+
+    if (!hasFiles && !hasValidUrl) {
+        // Not our event, let Foundry handle it
+        return;
+    }
+
+    // We will handle this event
+    event.preventDefault();
+
     let file
     if (!files || files.length === 0) {
-        let url = event.dataTransfer.getData("Text")
-        if (!url) {
-            console.log("DragUpload | No Files detected, exiting");
-            // Let Foundry handle the event instead
-            canvas._onDrop(event);
-            return;
-        }
+        let url = textData;
         // trimming query string
         if (url.includes("?")) url = url.substr(0, url.indexOf("?"))
         const splitUrl = url.split("/")
@@ -133,7 +144,7 @@ async function handleDrop(event) {
         if (!filename.includes(".")) {
             console.log("DragUpload | Dragged non-file text:", url);
             // Let Foundry handle the event instead
-            canvas._onDrop(event);
+            canvas._onDrop?.(event);
             return
         }
         const extension = filename.substr(filename.lastIndexOf(".") + 1)
@@ -144,7 +155,7 @@ async function handleDrop(event) {
         if (!validExtensions.includes(extension)) {
             console.log("DragUpload | Dragged file with bad extension:", url);
             // Let Foundry handle the event instead
-            canvas._onDrop(event);
+            canvas._onDrop?.(event);
             return
         }
         // special case: chrome imgur drag from an album gives a low-res webp file instead of a PNG
@@ -163,7 +174,7 @@ async function handleDrop(event) {
         console.log("Drag Upload | No Files detected");
 
         // Let Foundry handle the event instead
-        canvas._onDrop(event);
+        canvas._onDrop?.(event);
         return;
     }
     console.debug("file is: ");
@@ -219,7 +230,7 @@ async function CreateAmbientAudio(event, file) {
 
     convertXYtoCanvas(data, event);
 
-    canvas.sounds.activate();
+    canvas.ambientSounds.activate();
     await canvas.scene.createEmbeddedDocuments("AmbientSound", [data]);
 }
 
@@ -261,12 +272,9 @@ async function CreateTile(event, file, overhead) {
         }
     }
     else {
-        if ( overhead ) {
-            ui.controls.controls.find(c => c.name === "tiles").foreground = true;
-        } else {
-            ui.controls.controls.find(c => c.name === "tiles").foreground = false;
-        }
-        canvas.perception.update({refreshLighting: true, refreshTiles: true}, true);
+        canvas.tiles.activate();
+        canvas.tiles.foreground = overhead;
+        canvas.perception.update({refreshTiles: true});
     }
     return canvas.scene.createEmbeddedDocuments('Tile', [data], {});
 }
@@ -283,13 +291,57 @@ async function CreateJournalPin(event, file) {
     console.debug(response);
 
     const data = {
-        name: file.name,
+        name: cleanName(file.name),
         img: response.path
     };
 
     const journal = await JournalEntry.create(data);
     console.debug("Created journal entry: ");
     console.debug(journal);
+
+    // Choose page type
+    const pageTypes = ["image", "text"];
+
+    if (pageTypes.length > 1) {
+        let d = new Dialog({
+            title: "What Type should this Journal Page be created as?",
+            buttons: {},
+            default: pageTypes[0],
+            close: () => {}
+        }, {
+            width: 400
+        });
+        console.debug("Creating dialog: ");
+        console.debug(d);
+
+        pageTypes.forEach(x => {
+            d.data.buttons[x] = {
+                label: x,
+                callback: async () => await CreateJournalPageWithType(journal, response, cleanName(file.name), x, event)
+            }
+        });
+
+        d.render(true);
+    }
+    else {
+        await CreateJournalPageWithType(journal, response, cleanName(file.name), pageTypes[0], event);
+    }
+}
+
+async function CreateJournalPageWithType(journal, response, pageName, type, event) {
+    const pageData = {
+        name: pageName
+    };
+
+    if (type === "image") {
+        pageData.type = "image";
+        pageData.src = response.path;
+    } else if (type === "text") {
+        pageData.type = "text";
+        pageData.text = { content: `<img src="${response.path}" />` };
+    }
+
+    await journal.createEmbeddedDocuments("JournalEntryPage", [pageData]);
 
     const pinData = {
         entryId: journal.id,
@@ -319,7 +371,7 @@ async function CreateActor(event, file) {
     console.debug(response);
 
     const data = CreateImgData(event, response);
-    data.name = file.name;
+    data.name = cleanName(file.name);
     const tokenData = CreateImgData(event, response);
 
     if (Object.keys(CONST.IMAGE_FILE_EXTENSIONS).filter(x => file.name.endsWith(x)).length == 0) {
@@ -338,8 +390,10 @@ async function CreateActor(event, file) {
         let d = new Dialog({
             title: "What Type should this Actor be created as?",
             buttons: {},
-            default: types[0],
+            default: types[0],            
             close: () => {}
+           }, {
+            width: 800
            });
            console.debug("Creating dialog: ");
            console.debug(d);
@@ -367,9 +421,6 @@ async function CreateActorWithType(event, data, tokenImageData, type) {
     }
 
     let actorName = data.name;
-    if (actorName.includes(".")) {
-        actorName = actorName.split(".")[0];
-    }
 
     const actor = await getDocumentClass("Actor").create(
     {
@@ -418,7 +469,7 @@ async function CreateActorWithType(event, data, tokenImageData, type) {
     tokenData.actorLink = true;
 
     // Submit the Token creation request and activate the Tokens layer (if not already active)
-    canvas.getLayerByEmbeddedName("Token").activate();
+    canvas.tokens.activate();
     await canvas.scene.createEmbeddedDocuments('Token', [tokenData], {});
 
     // delete actor if it's actorless
@@ -437,13 +488,24 @@ function CreateImgData(event, response) {
     return data;
 }
 
+function cleanName(filename) {
+    let name = filename;
+    // Remove extension
+    if (name.includes(".")) {
+        name = name.split(".")[0];
+    }
+    // Replace underscores and dashes with spaces
+    name = name.replace(/_/g, " ").replace(/-/g, " ");
+    return name;
+}
+
 function convertXYtoCanvas(data, event) {
 
     // Acquire the cursor position transformed to Canvas coordinates
     const [x, y] = [event.clientX, event.clientY];
-    const t = canvas.stage.worldTransform;
-    data.x = (x - t.tx) / canvas.stage.scale.x;
-    data.y = (y - t.ty) / canvas.stage.scale.y;
+    const t = canvas.app.stage.worldTransform;
+    data.x = (x - t.tx) / canvas.app.stage.scale.x;
+    data.y = (y - t.ty) / canvas.app.stage.scale.y;
 
     // Allow other modules to overwrite this, such as Isometric
     Hooks.callAll("dragDropPositioning", { event: event, data: data });
